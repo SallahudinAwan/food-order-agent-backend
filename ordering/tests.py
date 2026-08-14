@@ -100,7 +100,12 @@ class OrderingApiTests(APITestCase):
         )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data["tools_used"], ["get_products"])
-        run_agent.assert_called_once_with(session_id=self.session_id, customer_id=self.customer_id, message="What products do you have?")
+        run_agent.assert_called_once_with(
+            session_id=self.session_id,
+            customer_id=self.customer_id,
+            message="What products do you have?",
+            language="auto",
+        )
 
     def test_python_tools_enforce_review_and_explicit_confirmation(self):
         conversation = AgentConversation.objects.create(session_id=self.session_id, customer_id=self.customer_id)
@@ -193,9 +198,29 @@ class OrderingApiTests(APITestCase):
         self.assertIn("Zinger Burger", result["reply"])
         calls = client_class.return_value.models.generate_content.call_args_list
         self.assertEqual(len(calls), 2)
-        self.assertEqual(calls[0].kwargs["config"].system_instruction, SYSTEM_PROMPT)
+        self.assertTrue(calls[0].kwargs["config"].system_instruction.startswith(SYSTEM_PROMPT))
+        self.assertIn("Reply in English", calls[0].kwargs["config"].system_instruction)
         function_response = calls[1].kwargs["contents"][-1].parts[0].function_response
         self.assertEqual(function_response.name, "get_products")
+
+    @patch("ordering.agent.genai.Client")
+    def test_manual_urdu_language_overrides_english_message(self, client_class):
+        content = types.Content(role="model", parts=[types.Part(text="آپ کیا آرڈر کرنا چاہیں گے؟")])
+        client_class.return_value.models.generate_content.return_value = types.GenerateContentResponse(
+            candidates=[types.Candidate(content=content)],
+        )
+
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "server-secret"}):
+            result = run_ordering_agent(
+                self.session_id,
+                self.customer_id,
+                "Show me the menu",
+                language="ur-PK",
+            )
+
+        self.assertIn("آپ", result["reply"])
+        config = client_class.return_value.models.generate_content.call_args.kwargs["config"]
+        self.assertIn("Reply in natural Urdu script", config.system_instruction)
 
     def test_agent_removes_markdown_and_speaks_english_prices_naturally(self):
         raw = "**Beef Burger:** Rs. 750.00\n* Chicken Pizza: 1200.00 rupees"

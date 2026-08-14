@@ -404,7 +404,19 @@ def format_speech_reply(reply: str) -> str:
     return re.sub(r"\s+", " ", cleaned).strip()
 
 
-def run_ordering_agent(session_id: str, customer_id: str, message: str) -> dict[str, Any]:
+def _response_language(language: str, message: str) -> str:
+    if language in {"en-PK", "ur-PK"}:
+        return language
+    return "ur-PK" if re.search(r"[\u0600-\u06FF]", message) else "en-PK"
+
+
+def _language_instruction(language: str) -> str:
+    if language == "ur-PK":
+        return "\n\nSELECTED RESPONSE LANGUAGE:\n- Reply in natural Urdu script, even if the customer writes in English or Roman Urdu."
+    return "\n\nSELECTED RESPONSE LANGUAGE:\n- Reply in English, even if the customer writes in Urdu or Roman Urdu."
+
+
+def run_ordering_agent(session_id: str, customer_id: str, message: str, language: str = "auto") -> dict[str, Any]:
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     if not api_key:
         raise AgentConfigurationError("GEMINI_API_KEY is not configured on the server.")
@@ -419,6 +431,7 @@ def run_ordering_agent(session_id: str, customer_id: str, message: str) -> dict[
     elif conversation.customer_id != customer_id:
         raise AgentRequestError("This ordering session belongs to a different customer.")
     toolbox = OrderingToolbox(conversation, customer_id, message)
+    response_language = _response_language(language, message)
 
     # Confirmation is a security-sensitive state transition, so Django handles it
     # deterministically once the exact cart has already been reviewed. The model
@@ -431,7 +444,7 @@ def run_ordering_agent(session_id: str, customer_id: str, message: str) -> dict[
             # explain that a fresh review and confirmation are required.
             pass
         else:
-            if re.search(r"[\u0600-\u06FF]", message):
+            if response_language == "ur-PK":
                 raw_reply = (
                     f"آپ کا آرڈر {order_result['order_number']} کامیابی سے پلیس ہو گیا ہے۔ "
                     f"کل رقم {order_result['total']} روپے ہے اور اسٹیٹس {order_result['status']} ہے۔"
@@ -461,7 +474,7 @@ def run_ordering_agent(session_id: str, customer_id: str, message: str) -> dict[
     contents = _history_contents(conversation.history)
     contents.append(types.Content(role="user", parts=[types.Part(text=message)]))
     config = types.GenerateContentConfig(
-        system_instruction=SYSTEM_PROMPT,
+        system_instruction=SYSTEM_PROMPT + _language_instruction(response_language),
         temperature=0.1,
         tools=[types.Tool(function_declarations=FUNCTION_DECLARATIONS)],
         automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
