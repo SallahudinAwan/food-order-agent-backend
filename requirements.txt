@@ -1,0 +1,9 @@
+Django>=5.2,<5.3
+djangorestframework>=3.16,<3.17
+django-cors-headers>=4.7,<5
+python-dotenv>=1.1,<2
+httpx>=0.28,<0.29
+google-genai>=2.18,<3
+edge-tts>=7.2,<8
+dj-database-url>=3.0,<4
+psycopg[binary]>=3.2,<4
