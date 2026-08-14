@@ -211,8 +211,11 @@ class OrderingApiTests(APITestCase):
         self.assertIn("سات سو پچاس", speech)
         self.assertNotIn("750.00", speech)
 
-    @patch("ordering.views.synthesize_speech", return_value=b"ID3-test-audio")
+    @patch("ordering.views.synthesize_speech")
     def test_urdu_speech_endpoint_returns_mpeg_audio(self, synthesize):
+        from .speech import SpeechAudio
+
+        synthesize.return_value = SpeechAudio(content=b"ID3-test-audio", content_type="audio/mpeg")
         response = self.client.post(
             "/api/speech/",
             {"text": "آپ کا آرڈر کنفرم ہو گیا ہے", "language": "ur-PK"},
@@ -222,6 +225,20 @@ class OrderingApiTests(APITestCase):
         self.assertEqual(response["Content-Type"], "audio/mpeg")
         self.assertEqual(response.content, b"ID3-test-audio")
         synthesize.assert_called_once_with(text="آپ کا آرڈر کنفرم ہو گیا ہے", language="ur-PK")
+
+    @patch("ordering.speech._synthesize_with_gemini")
+    @patch("ordering.speech._stream_speech")
+    def test_speech_uses_gemini_when_edge_tts_fails(self, edge_speech, gemini_speech):
+        from .speech import SpeechAudio, synthesize_speech
+
+        edge_speech.side_effect = RuntimeError("No audio received")
+        gemini_speech.return_value = SpeechAudio(content=b"RIFF-test-audio", content_type="audio/wav")
+
+        result = synthesize_speech("آپ کا آرڈر تیار ہے", "ur-PK")
+
+        self.assertEqual(result.content_type, "audio/wav")
+        self.assertEqual(result.content, b"RIFF-test-audio")
+        gemini_speech.assert_called_once_with("آپ کا آرڈر تیار ہے", "ur-PK")
 
     def test_speech_endpoint_rejects_unsupported_language(self):
         response = self.client.post(

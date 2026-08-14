@@ -20,6 +20,10 @@ services:
         sync: false
       - key: GEMINI_AGENT_MODEL
         value: gemini-3.1-flash-lite
+      - key: GEMINI_TTS_MODEL
+        value: gemini-3.1-flash-tts-preview
+      - key: GEMINI_TTS_VOICE
+        value: Sulafat
       - key: CORS_ALLOWED_ORIGINS
         value: https://food-order-agent-frontend.onrender.com
       - key: CSRF_TRUSTED_ORIGINS

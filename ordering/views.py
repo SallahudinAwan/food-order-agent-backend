@@ -83,6 +83,6 @@ def speech(request):
     except Exception:
         logger.exception("Speech synthesis request failed")
         return Response({"detail": "Urdu speech is temporarily unavailable."}, status=status.HTTP_502_BAD_GATEWAY)
-    response = HttpResponse(audio, content_type="audio/mpeg")
+    response = HttpResponse(audio.content, content_type=audio.content_type)
     response["Cache-Control"] = "no-store"
     return response
