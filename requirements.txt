@@ -1,6 +1,8 @@
 Django>=5.2,<5.3
 djangorestframework>=3.16,<3.17
 django-cors-headers>=4.7,<5
+gunicorn>=23,<24
+whitenoise[brotli]>=6.9,<7
 python-dotenv>=1.1,<2
 httpx>=0.28,<0.29
 google-genai>=2.18,<3
