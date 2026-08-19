@@ -22,6 +22,7 @@ class AgentMessageSerializer(serializers.Serializer):
     session_id = serializers.CharField(max_length=100)
     customer_id = serializers.CharField(max_length=100)
     message = serializers.CharField(max_length=1000, allow_blank=False, trim_whitespace=True)
+    language = serializers.ChoiceField(choices=["auto", "en-PK", "ur-PK"], required=False, default="auto")
 
 class CustomerSerializer(serializers.Serializer):
     customer_id = serializers.CharField(max_length=100)

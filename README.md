@@ -1,6 +1,6 @@
 # Food Order Agent Backend
 
-Production Django API for the Food Order Agent. It owns the Gemini integration, ordering tools, server-side speech synthesis, cart and order state, and PostgreSQL persistence.
+Production Django API for the Food Order Agent. Its ordering workflow runs on LangChain with Gemini, while Django tools enforce cart and checkout rules. The backend also owns server-side speech synthesis, cart and order state, and PostgreSQL persistence.
 
 ## Render deployment
 
