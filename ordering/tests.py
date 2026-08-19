@@ -1,8 +1,8 @@
 from decimal import Decimal
 import os
 from unittest.mock import patch
-from google.genai import types
 from django.urls import reverse
+from langchain.messages import AIMessage, HumanMessage
 from rest_framework.test import APITestCase
 from .agent import OrderingToolbox, SYSTEM_PROMPT, _is_explicit_confirmation, format_display_reply, format_speech_reply, run_ordering_agent
 from .models import AgentConversation, Cart, CartItem, Order, Product
@@ -142,8 +142,8 @@ class OrderingApiTests(APITestCase):
         self.assertFalse(_is_explicit_confirmation("do not place the order"))
         self.assertFalse(_is_explicit_confirmation("can you confirm the total?"))
 
-    @patch("ordering.agent.genai.Client")
-    def test_confirmed_review_places_order_without_model_reinterpretation(self, client_class):
+    @patch("ordering.agent.ChatGoogleGenerativeAI")
+    def test_confirmed_review_places_order_without_model_reinterpretation(self, model_class):
         conversation = AgentConversation.objects.create(session_id=self.session_id, customer_id=self.customer_id)
         toolbox = OrderingToolbox(conversation, self.customer_id, "Add one Zinger")
         toolbox.add_to_cart(self.zinger.id, 1)
@@ -160,7 +160,7 @@ class OrderingApiTests(APITestCase):
         self.assertEqual(result["tools_used"], ["create_order"])
         self.assertIn("has been placed successfully", result["reply"])
         self.assertEqual(Order.objects.count(), 1)
-        client_class.assert_not_called()
+        model_class.assert_not_called()
 
     def test_order_history_is_customer_scoped_and_includes_status(self):
         self.add()
@@ -179,36 +179,47 @@ class OrderingApiTests(APITestCase):
         self.assertEqual(response.data[0]["items"][0]["name"], "Zinger Burger")
         self.assertEqual(self.client.get("/api/orders/?customer_id=someone-else").data, [])
 
-    @patch("ordering.agent.genai.Client")
-    def test_python_agent_executes_product_tool_and_uses_python_prompt(self, client_class):
-        first_content = types.Content(
-            role="model",
-            parts=[types.Part.from_function_call(name="get_products", args={"query": "Zinger"})],
-        )
-        second_content = types.Content(role="model", parts=[types.Part(text="We offer a Zinger Burger for 650.00.")])
-        client_class.return_value.models.generate_content.side_effect = [
-            types.GenerateContentResponse(candidates=[types.Candidate(content=first_content)]),
-            types.GenerateContentResponse(candidates=[types.Candidate(content=second_content)]),
-        ]
+    @patch("ordering.agent.create_agent")
+    @patch("ordering.agent.ChatGoogleGenerativeAI")
+    def test_langchain_agent_executes_product_tool_and_uses_python_prompt(self, model_class, create_agent_mock):
+        def invoke_agent(payload, config):
+            tools = {ordering_tool.name: ordering_tool for ordering_tool in create_agent_mock.call_args.kwargs["tools"]}
+            tool_result = tools["get_products"].invoke({"query": "Zinger"})
+            self.assertEqual(tool_result["result"][0]["name"], "Zinger Burger")
+            self.assertEqual(config, {"recursion_limit": 18})
+            return {
+                "messages": [
+                    *payload["messages"],
+                    AIMessage(content="We offer a Zinger Burger for 650.00."),
+                ]
+            }
+
+        create_agent_mock.return_value.invoke.side_effect = invoke_agent
 
         with patch.dict(os.environ, {"GEMINI_API_KEY": "server-secret", "GEMINI_AGENT_MODEL": "gemini-3.1-flash-lite"}):
             result = run_ordering_agent(self.session_id, self.customer_id, "Do you have a Zinger?")
 
         self.assertEqual(result["tools_used"], ["get_products"])
         self.assertIn("Zinger Burger", result["reply"])
-        calls = client_class.return_value.models.generate_content.call_args_list
-        self.assertEqual(len(calls), 2)
-        self.assertTrue(calls[0].kwargs["config"].system_instruction.startswith(SYSTEM_PROMPT))
-        self.assertIn("Reply in English", calls[0].kwargs["config"].system_instruction)
-        function_response = calls[1].kwargs["contents"][-1].parts[0].function_response
-        self.assertEqual(function_response.name, "get_products")
-
-    @patch("ordering.agent.genai.Client")
-    def test_manual_urdu_language_overrides_english_message(self, client_class):
-        content = types.Content(role="model", parts=[types.Part(text="آپ کیا آرڈر کرنا چاہیں گے؟")])
-        client_class.return_value.models.generate_content.return_value = types.GenerateContentResponse(
-            candidates=[types.Candidate(content=content)],
+        model_class.assert_called_once_with(
+            model="gemini-3.1-flash-lite",
+            api_key="server-secret",
+            temperature=0.1,
         )
+        agent_config = create_agent_mock.call_args.kwargs
+        self.assertIs(agent_config["model"], model_class.return_value)
+        self.assertTrue(agent_config["system_prompt"].startswith(SYSTEM_PROMPT))
+        self.assertIn("Reply in English", agent_config["system_prompt"])
+        invocation = create_agent_mock.return_value.invoke.call_args.args[0]
+        self.assertIsInstance(invocation["messages"][-1], HumanMessage)
+        self.assertEqual(invocation["messages"][-1].content, "Do you have a Zinger?")
+
+    @patch("ordering.agent.create_agent")
+    @patch("ordering.agent.ChatGoogleGenerativeAI")
+    def test_manual_urdu_language_overrides_english_message(self, model_class, create_agent_mock):
+        create_agent_mock.return_value.invoke.return_value = {
+            "messages": [AIMessage(content="آپ کیا آرڈر کرنا چاہیں گے؟")]
+        }
 
         with patch.dict(os.environ, {"GEMINI_API_KEY": "server-secret"}):
             result = run_ordering_agent(
@@ -219,8 +230,8 @@ class OrderingApiTests(APITestCase):
             )
 
         self.assertIn("آپ", result["reply"])
-        config = client_class.return_value.models.generate_content.call_args.kwargs["config"]
-        self.assertIn("Reply in natural Urdu script", config.system_instruction)
+        system_prompt = create_agent_mock.call_args.kwargs["system_prompt"]
+        self.assertIn("Reply in natural Urdu script", system_prompt)
 
     def test_agent_removes_markdown_and_speaks_english_prices_naturally(self):
         raw = "**Beef Burger:** Rs. 750.00\n* Chicken Pizza: 1200.00 rupees"

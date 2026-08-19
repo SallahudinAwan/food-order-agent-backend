@@ -2,12 +2,16 @@ import hashlib
 import json
 import os
 import re
+from threading import Lock
 from typing import Any
 
 from django.db import transaction
 from django.db.models import Q
-from google import genai
-from google.genai import types
+from langchain.agents import create_agent
+from langchain.messages import AIMessage, HumanMessage
+from langchain.tools import BaseTool, tool
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langgraph.errors import GraphRecursionError
 from rest_framework.exceptions import ValidationError
 
 from .models import AgentConversation, Cart, CartItem, Product
@@ -36,6 +40,7 @@ TOOL RULES:
 - Call get_cart for every cart, quantity, subtotal, or total question.
 - Call get_orders for every question about previous orders, order history, order numbers, or order status.
 - Use the matching mutation tool for requested cart changes and report only the returned result.
+- Call exactly one tool at a time and wait for its result before choosing the next action.
 - If multiple products match, list the matching tool results briefly and ask which one the customer wants.
 - If a tool returns an error, explain it briefly and never claim success.
 
@@ -46,76 +51,6 @@ ORDER CONFIRMATION:
 - A changed cart requires another review. The Python create_order tool independently enforces these rules.
 
 Keep replies concise, friendly, and suitable for speech. Do not mention tool names, JSON, database IDs, or internal steps."""
-
-
-FUNCTION_DECLARATIONS = [
-    types.FunctionDeclaration(
-        name="get_products",
-        description="Get authoritative available products. Use for all menu, product, category, price, and availability questions and before adding an item.",
-        parameters_json_schema={
-            "type": "object",
-            "properties": {"query": {"type": "string", "description": "Product/category search. Empty lists the full menu."}},
-        },
-    ),
-    types.FunctionDeclaration(
-        name="get_cart",
-        description="Get the current cart with authoritative quantities, prices, and totals.",
-        parameters_json_schema={"type": "object", "properties": {}},
-    ),
-    types.FunctionDeclaration(
-        name="get_orders",
-        description="Get this customer's authoritative order history, including order numbers, items, totals, dates, and current statuses.",
-        parameters_json_schema={"type": "object", "properties": {}},
-    ),
-    types.FunctionDeclaration(
-        name="add_to_cart",
-        description="Add a positive quantity of a product returned by get_products.",
-        parameters_json_schema={
-            "type": "object",
-            "properties": {
-                "product_id": {"type": "integer", "minimum": 1},
-                "quantity": {"type": "integer", "minimum": 1},
-            },
-            "required": ["product_id", "quantity"],
-        },
-    ),
-    types.FunctionDeclaration(
-        name="update_cart_item",
-        description="Set an existing cart item's quantity.",
-        parameters_json_schema={
-            "type": "object",
-            "properties": {
-                "cart_item_id": {"type": "integer", "minimum": 1},
-                "quantity": {"type": "integer", "minimum": 1},
-            },
-            "required": ["cart_item_id", "quantity"],
-        },
-    ),
-    types.FunctionDeclaration(
-        name="remove_from_cart",
-        description="Remove an existing item from the current cart.",
-        parameters_json_schema={
-            "type": "object",
-            "properties": {"cart_item_id": {"type": "integer", "minimum": 1}},
-            "required": ["cart_item_id"],
-        },
-    ),
-    types.FunctionDeclaration(
-        name="clear_cart",
-        description="Remove all items from the current cart.",
-        parameters_json_schema={"type": "object", "properties": {}},
-    ),
-    types.FunctionDeclaration(
-        name="review_order",
-        description="Read and lock the current cart contents for confirmation before order placement.",
-        parameters_json_schema={"type": "object", "properties": {}},
-    ),
-    types.FunctionDeclaration(
-        name="create_order",
-        description="Create the order after review and the user's explicit confirmation in the current message.",
-        parameters_json_schema={"type": "object", "properties": {}},
-    ),
-]
 
 
 class AgentConfigurationError(Exception):
@@ -321,14 +256,94 @@ class OrderingToolbox:
         }
 
 
-def _history_contents(history: list[dict[str, str]]) -> list[types.Content]:
-    contents: list[types.Content] = []
+def _history_messages(history: list[dict[str, str]]) -> list[HumanMessage | AIMessage]:
+    messages: list[HumanMessage | AIMessage] = []
     for message in history[-12:]:
-        role = "model" if message.get("role") == "assistant" else "user"
         text = str(message.get("text", "")).strip()
         if text:
-            contents.append(types.Content(role=role, parts=[types.Part(text=text)]))
-    return contents
+            message_type = AIMessage if message.get("role") == "assistant" else HumanMessage
+            messages.append(message_type(content=text))
+    return messages
+
+
+def _ordering_tools(toolbox: OrderingToolbox) -> list[BaseTool]:
+    execution_lock = Lock()
+
+    def execute(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        # LangGraph can schedule tool calls concurrently. The ordering tools mutate
+        # shared cart state, so serialize them even if a model ignores the prompt's
+        # instruction to call one tool at a time.
+        with execution_lock:
+            try:
+                return {"result": toolbox.execute(name, arguments)}
+            except Exception as error:
+                return {"error": _error_detail(error)}
+
+    @tool(
+        "get_products",
+        description=(
+            "Get authoritative available products. Use for every menu, product, category, "
+            "price, or availability question and before adding an item."
+        ),
+    )
+    def get_products(query: str = "") -> dict[str, Any]:
+        return execute("get_products", {"query": query})
+
+    @tool("get_cart", description="Get the current cart with authoritative quantities, prices, and totals.")
+    def get_cart() -> dict[str, Any]:
+        return execute("get_cart", {})
+
+    @tool(
+        "get_orders",
+        description=(
+            "Get this customer's authoritative order history, including order numbers, "
+            "items, totals, dates, and current statuses."
+        ),
+    )
+    def get_orders() -> dict[str, Any]:
+        return execute("get_orders", {})
+
+    @tool("add_to_cart", description="Add a positive quantity of a product returned by get_products.")
+    def add_to_cart(product_id: int, quantity: int) -> dict[str, Any]:
+        return execute("add_to_cart", {"product_id": product_id, "quantity": quantity})
+
+    @tool("update_cart_item", description="Set an existing cart item's quantity to a positive integer.")
+    def update_cart_item(cart_item_id: int, quantity: int) -> dict[str, Any]:
+        return execute("update_cart_item", {"cart_item_id": cart_item_id, "quantity": quantity})
+
+    @tool("remove_from_cart", description="Remove an existing item from the current cart.")
+    def remove_from_cart(cart_item_id: int) -> dict[str, Any]:
+        return execute("remove_from_cart", {"cart_item_id": cart_item_id})
+
+    @tool("clear_cart", description="Remove all items from the current cart.")
+    def clear_cart() -> dict[str, Any]:
+        return execute("clear_cart", {})
+
+    @tool(
+        "review_order",
+        description="Read and lock the current cart contents for confirmation before order placement.",
+    )
+    def review_order() -> dict[str, Any]:
+        return execute("review_order", {})
+
+    @tool(
+        "create_order",
+        description="Create the order after review and the user's explicit confirmation in the current message.",
+    )
+    def create_order() -> dict[str, Any]:
+        return execute("create_order", {})
+
+    return [
+        get_products,
+        get_cart,
+        get_orders,
+        add_to_cart,
+        update_cart_item,
+        remove_from_cart,
+        clear_cart,
+        review_order,
+        create_order,
+    ]
 
 
 def _strip_markdown(text: str) -> str:
@@ -471,46 +486,33 @@ def run_ordering_agent(session_id: str, customer_id: str, message: str, language
                 "tools_used": toolbox.tools_used,
             }
 
-    contents = _history_contents(conversation.history)
-    contents.append(types.Content(role="user", parts=[types.Part(text=message)]))
-    config = types.GenerateContentConfig(
-        system_instruction=SYSTEM_PROMPT + _language_instruction(response_language),
-        temperature=0.1,
-        tools=[types.Tool(function_declarations=FUNCTION_DECLARATIONS)],
-        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-    )
-
     try:
-        client = genai.Client(api_key=api_key)
-        reply = ""
-        for _ in range(8):
-            response = client.models.generate_content(
-                model=os.getenv("GEMINI_AGENT_MODEL", "gemini-3.1-flash-lite"),
-                contents=contents,
-                config=config,
-            )
-            if not response.candidates or not response.candidates[0].content:
-                raise AgentProviderError("Gemini returned an empty response.")
-            model_content = response.candidates[0].content
-            function_parts = [part for part in model_content.parts or [] if part.function_call]
-            if not function_parts:
-                reply = "".join(part.text or "" for part in model_content.parts or []).strip()
-                break
-
-            contents.append(model_content)
-            tool_response_parts = []
-            for part in function_parts:
-                call = part.function_call
-                name = call.name or ""
-                try:
-                    result = toolbox.execute(name, dict(call.args or {}))
-                    payload = {"result": result}
-                except Exception as error:
-                    payload = {"error": _error_detail(error)}
-                tool_response_parts.append(types.Part.from_function_response(name=name, response=payload))
-            contents.append(types.Content(role="user", parts=tool_response_parts))
-        else:
-            raise AgentProviderError("The ordering agent exceeded its tool-call limit.")
+        model = ChatGoogleGenerativeAI(
+            model=os.getenv("GEMINI_AGENT_MODEL", "gemini-3.1-flash-lite"),
+            api_key=api_key,
+            temperature=0.1,
+        )
+        agent = create_agent(
+            model=model,
+            tools=_ordering_tools(toolbox),
+            system_prompt=SYSTEM_PROMPT + _language_instruction(response_language),
+            name="ordering_agent",
+        )
+        result = agent.invoke(
+            {"messages": [*_history_messages(conversation.history), HumanMessage(content=message)]},
+            config={"recursion_limit": 18},
+        )
+        final_message = next(
+            (
+                candidate
+                for candidate in reversed(result.get("messages", []))
+                if isinstance(candidate, AIMessage) and not candidate.tool_calls
+            ),
+            None,
+        )
+        reply = str(final_message.text).strip() if final_message else ""
+    except GraphRecursionError as error:
+        raise AgentProviderError("The ordering agent exceeded its tool-call limit.") from error
     except AgentProviderError:
         raise
     except Exception as error:
